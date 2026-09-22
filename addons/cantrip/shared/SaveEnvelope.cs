@@ -14,7 +14,11 @@ namespace Cantrip.GodotAdapter
         /// <summary>The envelope carries no snapshot.</summary>
         NoPayload,
 
-        /// <summary>The content loaded now is not the content the save was taken against.</summary>
+        /// <summary>
+        /// The content loaded now is not the content the save was taken against. From
+        /// <c>CantripRuntime.LoadSave</c>, it means the rules refused the save: something it needs
+        /// has gone.
+        /// </summary>
         ContentChanged,
     }
 
@@ -35,18 +39,20 @@ namespace Cantrip.GodotAdapter
         public string Message { get; }
 
         /// <summary>The rejection as a snake_case word, for the dictionary that crosses into script.</summary>
-        public string ReasonName => Reason == SaveRejection.None ? "none" : Snake(Reason.ToString());
+        public string ReasonName => NameOf(Reason);
 
-        private static string Snake(string name)
+        /// <summary>
+        /// The word script is given for each rejection, written out for the same reason as
+        /// <see cref="ChoiceAnswer.NameOf"/>: renaming a member must not quietly change one.
+        /// </summary>
+        public static string NameOf(SaveRejection reason) => reason switch
         {
-            var text = new System.Text.StringBuilder(name.Length + 2);
-            for (int i = 0; i < name.Length; i++)
-            {
-                if (i > 0 && char.IsUpper(name[i])) text.Append('_');
-                text.Append(char.ToLowerInvariant(name[i]));
-            }
-            return text.ToString();
-        }
+            SaveRejection.None => "none",
+            SaveRejection.WrongFormat => "wrong_format",
+            SaveRejection.NoPayload => "no_payload",
+            SaveRejection.ContentChanged => "content_changed",
+            _ => throw new ArgumentOutOfRangeException(nameof(reason), reason, "This rejection has no word for script yet."),
+        };
 
         public override string ToString() => Accepted ? "accepted" : ReasonName + ": " + Message;
     }
@@ -56,14 +62,18 @@ namespace Cantrip.GodotAdapter
     /// content it was taken against.
     /// </summary>
     /// <remarks>
-    /// The fingerprint is the point of this type. <c>GameState.Restore</c> refuses a snapshot
-    /// naming a definition that is no longer loaded, and it refuses it by throwing, halfway
-    /// through tearing the old game down. Checking <c>ContentLibrary.Fingerprint</c> first turns
-    /// "the player loaded a save from before the patch" into a message the game can show while its
-    /// current game is still intact.
+    /// The fingerprint covers the kinds and names of every definition, content verb and resource,
+    /// and nothing else, so rebalancing a card leaves it as it was, while adding, renaming or
+    /// deleting a definition changes it. Comparing it with <c>ContentLibrary.Fingerprint</c> says
+    /// "this save is from before a patch" before the snapshot is even read.
     /// <para>
-    /// The fingerprint covers the kinds and names of every definition, and nothing else, so
-    /// rebalancing a card does not invalidate anyone's save; deleting or renaming one does.
+    /// A mismatch is not a verdict on the save. A patch that only adds a card changes the
+    /// fingerprint, and the save still has everything it needs. <c>CardRuntime.Restore</c> looks
+    /// up what the snapshot needs, the definitions it names and any <c>next turn:</c> or
+    /// <c>in N turns:</c> block waiting in it, and refuses by throwing, before it changes anything,
+    /// when one has gone. So the node lets a mismatched save through to the restore, and reports
+    /// the restore's refusal as <see cref="SaveRejection.ContentChanged"/>; only a wrong format
+    /// and a missing payload are refused here.
     /// </para>
     /// </remarks>
     public sealed class SaveEnvelope
@@ -91,10 +101,11 @@ namespace Cantrip.GodotAdapter
             new SaveEnvelope(CurrentFormat, fingerprint, payload);
 
         /// <summary>
-        /// Whether this save can be restored into content whose fingerprint is
-        /// <paramref name="libraryFingerprint"/>. It decides nothing by itself: the caller may
-        /// still load a mismatched save deliberately, and gets the core's own error if a definition
-        /// the snapshot needs has really gone.
+        /// Whether this save was taken against content whose fingerprint is
+        /// <paramref name="libraryFingerprint"/>, in a format this addon reads and with a game in
+        /// it. It decides nothing by itself: a mismatched fingerprint is a reason to let the
+        /// restore check the save, which the node does, and the caller gets the core's own error if
+        /// a definition the snapshot needs has really gone.
         /// </summary>
         public SaveCheck Check(string? libraryFingerprint)
         {

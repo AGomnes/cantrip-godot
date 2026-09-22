@@ -25,7 +25,8 @@ namespace Cantrip.GodotAdapter
     /// Events do not reach the game while the rules are resolving. The host appends each resolved
     /// event to a buffer and this node drains it once the action has finished, because a script
     /// handler that called back into the engine mid-resolution would re-enter an interpreter that
-    /// is not re-entrant. Every public entry point refuses a nested call for the same reason.
+    /// is not re-entrant. Every entry point that changes the game, setting it up included, refuses
+    /// a call from inside a host callback for the same reason; only the queries answer there.
     /// </para>
     /// </remarks>
     [GlobalClass]
@@ -48,7 +49,10 @@ namespace Cantrip.GodotAdapter
         [Export]
         public string ContentFolder { get; set; } = "res://content";
 
-        /// <summary>Loads content when the node enters the tree. Turn it off to load by hand.</summary>
+        /// <summary>
+        /// Loads content when the node enters the tree, reporting any errors and warnings in the
+        /// Output panel. Turn it off to load by hand and receive them from <see cref="LoadContent"/>.
+        /// </summary>
         [Export]
         public bool AutoLoad { get; set; } = true;
 
@@ -108,13 +112,24 @@ namespace Cantrip.GodotAdapter
         public override void _Ready()
         {
             if (Driver != null) Driver.Drive = count => Tick(count);
-            if (AutoLoad) LoadContent(ContentFolder);
+
+            // Nobody receives what an automatic load returns, so the Output panel is told instead. A
+            // content error the editor dock alone shows is invisible to whoever is running the game.
+            if (AutoLoad) Report(Load(ContentFolder));
         }
 
         public override void _ExitTree()
         {
             _debug?.Uninstall();
             _debug = null;
+        }
+
+        public override void _Notification(int what)
+        {
+            // Let go of the registered callables while GDScript is still there to free them. Held
+            // until Godot shuts down, a lambda is released after GDScript has gone, and the game
+            // crashes on exit. Not on leaving the tree, which a node that is only moving also does.
+            if (what == NotificationPredelete) _host.ClearCallbacks();
         }
 
         // Content --------------------------------------------------------------------------------
@@ -124,15 +139,7 @@ namespace Cantrip.GodotAdapter
         /// This goes through the engine's own file access, so it works the same in the editor and
         /// inside an exported game, where the project's files are not on disk at all.
         /// </summary>
-        public Godot.Collections.Array LoadContent(string folder = "")
-        {
-            if (_core != null) throw new InvalidOperationException("Content is already in play; use ReloadContent to change it.");
-
-            Content = new ContentLibrary();
-            DiagnosticBag problems = GodotContentLoader.LoadFolder(Content, string.IsNullOrEmpty(folder) ? ContentFolder : folder);
-            _describerGeneration = -1;
-            return VariantMap.Diagnostics(problems);
-        }
+        public Godot.Collections.Array LoadContent(string folder = "") => VariantMap.Diagnostics(Load(folder));
 
         /// <summary>
         /// Reloads content into a running game and rebinds everything live to it. Stats the game has
@@ -164,15 +171,29 @@ namespace Cantrip.GodotAdapter
         }
 
         // Setup ----------------------------------------------------------------------------------
+        //
+        // These run no rules, so they do not go through Act, but they do change the game, so a host
+        // callback may no more call them than play a card.
 
-        public int CreatePlayer(string name = "Player", int hp = 80, int maxEnergy = 3) =>
-            EnsureRuntime().CreatePlayer(name, hp, maxEnergy).Id;
+        public int CreatePlayer(string name = "Player", int hp = 80, int maxEnergy = 3)
+        {
+            CardRuntime core = EnsureRuntime();
+            Guard();
+            return core.CreatePlayer(name, hp, maxEnergy).Id;
+        }
 
-        public int AddCard(string name, string zone = Zones.Draw) => EnsureRuntime().AddCard(name, zone).Id;
+        public int AddCard(string name, string zone = Zones.Draw)
+        {
+            CardRuntime core = EnsureRuntime();
+            Guard();
+            return core.AddCard(name, zone).Id;
+        }
 
         public Godot.Collections.Array AddDeck(Godot.Collections.Array names)
         {
             CardRuntime core = EnsureRuntime();
+            Guard();
+
             var ids = new Godot.Collections.Array();
             foreach (string name in VariantMap.ToStrings(names)) ids.Add(core.AddCard(name).Id);
             return ids;
@@ -183,6 +204,7 @@ namespace Cantrip.GodotAdapter
         public int SpawnEnemy(string name, int hp = 0)
         {
             CardRuntime core = EnsureRuntime();
+            Guard();
             return core.SpawnEnemy(name, hp <= 0 ? (int?)null : hp).Id;
         }
 
@@ -198,8 +220,62 @@ namespace Cantrip.GodotAdapter
         public int GrantAbility(string name, int ownerId)
         {
             CardRuntime core = EnsureRuntime();
+            Guard();
+
             Entity? owner = core.State.Find(ownerId);
             return owner == null ? VariantMap.NoEntity : core.GrantAbility(name, owner).Id;
+        }
+
+        /// <summary>
+        /// Takes a card out of the game for good, as <c>destroy</c> does in content and as
+        /// <c>Execute("destroy target", 0, cardId)</c> would: the way to remove a card from the deck
+        /// between battles, or to swap one for its upgraded definition. Content hears it as
+        /// <c>destroyed</c>. Returns whether the card is gone; false, having changed nothing, when
+        /// the id is not a card still in the game.
+        /// </summary>
+        public bool RemoveCard(int cardId)
+        {
+            CardRuntime core = EnsureRuntime();
+            Guard();
+
+            Entity? card = core.State.Find(cardId);
+            if (card == null || card.Kind != EntityKind.Card || card.IsRemoved) return false;
+
+            return Act(() =>
+            {
+                core.Execute("destroy target", null, card);
+                return card.IsRemoved;
+            });
+        }
+
+        /// <summary>
+        /// Starts a new run on this node: the rules begin again from the loaded content, with no
+        /// player, cards or enemies. <see cref="Seed"/> and the other exports are read again, so set
+        /// a new seed first.
+        /// </summary>
+        /// <remarks>
+        /// What belonged to the old run goes with it: a choice waiting for an answer, events not yet
+        /// delivered, including the rest of a batch being delivered when this is called from an
+        /// <c>EffectEvent</c> handler, and whatever the <see cref="Presenter"/> has queued. No
+        /// signal says the old battle ended. The content stays as it is, reloads included, so a
+        /// ruleset a reload changed takes effect now. The callables registered with
+        /// <see cref="RegisterName"/> and <see cref="RegisterFunction"/> stay registered.
+        /// <see cref="Core"/> is a new object afterwards.
+        /// </remarks>
+        public void NewRun()
+        {
+            Guard();
+
+            _debug?.Uninstall();
+            _debug = null;
+            _core = null;
+
+            _choices.Close();
+            _announcedChoice = 0;
+            Buffer.Reset();
+            if (Presenter != null && IsInstanceValid(Presenter)) Presenter.SkipAll();
+
+            EnsureRuntime();
         }
 
         // Battle flow ----------------------------------------------------------------------------
@@ -261,7 +337,17 @@ namespace Cantrip.GodotAdapter
             return Act(() => core.UseAbility(ability, target));
         }
 
-        /// <summary>Runs DSL statements, as a developer console would. Not for shipping game code.</summary>
+        /// <summary>
+        /// Runs statements as content would, as the player unless <paramref name="selfId"/> names
+        /// someone else: a console line, a cheat key, or a small step a game takes between battles,
+        /// such as a rest with <c>Execute("heal 12", 0, 0)</c>.
+        /// </summary>
+        /// <remarks>
+        /// The text is parsed on every call and the linter never sees it, so a mistake shows only
+        /// when the line runs, as an error in the Output panel. Keep it to a line or two: anything
+        /// longer, anything run often, and anything a card, relic or status should own belongs in
+        /// content, where it is checked and tested. Like any other action it can stop for a choice.
+        /// </remarks>
         public void Execute(string statements, int selfId = 0, int targetId = 0)
         {
             CardRuntime core = EnsureRuntime();
@@ -367,18 +453,57 @@ namespace Cantrip.GodotAdapter
             return VariantMap.Description(DescriptionView.Of(Describer().DescribeIntent(enemy, core), forOpponent: true));
         }
 
+        /// <summary>
+        /// The rules text of a definition that need not be in play, such as a reward, a shop's stock
+        /// or a page of a card library, with its printed values: the same dictionary as
+        /// <see cref="Describe"/>. An empty <paramref name="kind"/> takes the first definition of
+        /// that name. Empty when nothing of that name is loaded. Name and kind are matched without
+        /// regard to case, as <see cref="GetDefinitions"/> matches the kind.
+        /// </summary>
+        /// <remarks>It reads the content alone, so it does not bring the rules into being.</remarks>
+        public Godot.Collections.Dictionary DescribeDefinition(string name, string kind = "")
+        {
+            // Kinds are stored as the keyword that declares them, which is lower case.
+            EntityDefinition? definition = Content.Find(name ?? string.Empty, string.IsNullOrEmpty(kind) ? null : kind.ToLowerInvariant());
+            return definition == null
+                ? new Godot.Collections.Dictionary()
+                : VariantMap.Description(DescriptionView.Of(Describer().Describe(definition)));
+        }
+
+        /// <summary>
+        /// The names of every loaded definition of one kind, such as "card" or "relic", with
+        /// <paramref name="tag"/> among its tags unless that is empty: the pool a reward screen or a
+        /// shop picks from. Sorted by name, which a reload does not disturb, so a pick made from it
+        /// with the game's own seeded random numbers replays.
+        /// </summary>
+        /// <remarks>It reads the content alone, so it does not bring the rules into being.</remarks>
+        public Godot.Collections.Array GetDefinitions(string kind, string tag = "")
+        {
+            var names = new Godot.Collections.Array();
+            foreach (EntityDefinition definition in Content.Pool(kind ?? string.Empty))
+            {
+                if (string.IsNullOrEmpty(tag) || definition.HasTag(tag)) names.Add(definition.Name);
+            }
+            return names;
+        }
+
         public bool IsInBattle() => EnsureRuntime().State.InBattle;
 
         public int GetTurn() => EnsureRuntime().State.Turn;
 
-        /// <summary>True, false, or null while a battle is still running.</summary>
+        /// <summary>
+        /// Whether the player won the battle that ended last: null while a battle is running and
+        /// before the first one has ended.
+        /// </summary>
         public Variant GetWon()
         {
+            // Spelled out: in a conditional against a bool, a bare default is false, not null.
             bool? won = EnsureRuntime().Won;
-            return won.HasValue ? won.Value : default;
+            if (won == null) return default(Variant);
+            return won.Value;
         }
 
-        /// <summary>The rules state as one number, for desync checks and replay tests.</summary>
+        /// <summary>The rules state as one number, for checking that two runs agree, as replay tests do.</summary>
         public string StateHash() => EnsureRuntime().State.ComputeHash().ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
 
         // Choices --------------------------------------------------------------------------------
@@ -407,7 +532,7 @@ namespace Cantrip.GodotAdapter
                 return new Godot.Collections.Dictionary
                 {
                     ["accepted"] = false,
-                    ["reason"] = answer.Reason.ToString().ToLowerInvariant(),
+                    ["reason"] = answer.ReasonName,
                     ["message"] = answer.Message,
                 };
             }
@@ -429,23 +554,35 @@ namespace Cantrip.GodotAdapter
         /// <summary>Abandons the pending choice. The interrupted action never happened.</summary>
         public void CancelChoice()
         {
-            EnsureRuntime().CancelPending();
+            CardRuntime core = EnsureRuntime();
+            Guard();
+
+            core.CancelPending();
             SyncChoice();
         }
 
         // Save and load --------------------------------------------------------------------------
 
-        /// <summary>Whether a save would succeed: snapshots are only valid between actions.</summary>
+        /// <summary>
+        /// Whether a save would succeed: not while effects are resolving, nor while a block that a
+        /// reload has changed is still waiting to run.
+        /// </summary>
         public bool CanSave() => !_busy && EnsureRuntime().CanCapture;
 
         /// <summary>
-        /// The whole game as a string, with the fingerprint of the content it was taken against so a
-        /// save from before a patch can be refused with a message rather than a crash.
+        /// The whole game as a string, with the fingerprint of the content it was taken against.
+        /// When no save can be made it throws an <see cref="InvalidOperationException"/> that says
+        /// why: effects still resolving, or, in the rules' own words, a waiting block a reload has
+        /// changed.
         /// </summary>
         public string Save()
         {
             CardRuntime core = EnsureRuntime();
-            if (!core.CanCapture) throw new InvalidOperationException("Cannot save while effects are still resolving.");
+
+            // The rules see resolving only while their queue runs. A callback in the middle of a
+            // card's own effect finds the queue empty, and a snapshot taken there would hold half an
+            // action, so the node, which knows an action is under way, refuses it itself.
+            if (_busy) throw new InvalidOperationException("Cannot save while effects are still resolving.");
 
             SaveEnvelope envelope = SaveEnvelope.Wrap(Content.Fingerprint, JsonSerializer.Serialize(core.Capture()));
             return JsonSerializer.Serialize(new SaveFile
@@ -458,11 +595,22 @@ namespace Cantrip.GodotAdapter
 
         /// <summary>
         /// Restores a saved game. Returns whether it was accepted, and why not when it was refused;
-        /// nothing is touched unless the save is going to be applied.
+        /// a refused save leaves the game, and any choice it is waiting on, exactly as they were.
         /// </summary>
+        /// <remarks>
+        /// A fingerprint that differs says only that a definition has been added, renamed or removed
+        /// since the save was made, and a patch that only adds a card leaves every older save
+        /// loadable. So it is not a refusal by itself: the rules look up everything the save needs
+        /// as they restore, a definition it names and a waiting <c>next turn:</c> or
+        /// <c>in N turns:</c> block included, and refuse before changing anything. That refusal,
+        /// like any other snapshot the rules turn down, comes back as "content_changed" with their
+        /// message.
+        /// </remarks>
         public Godot.Collections.Dictionary LoadSave(string json)
         {
             CardRuntime core = EnsureRuntime();
+            Guard();
+
             SaveFile? file;
             try
             {
@@ -477,12 +625,38 @@ namespace Cantrip.GodotAdapter
 
             var envelope = new SaveEnvelope(file.Format, file.Fingerprint, file.Snapshot);
             SaveCheck check = envelope.Check(Content.Fingerprint);
-            if (!check.Accepted) return Refused(check.ReasonName, check.Message);
+            if (!check.Accepted && check.Reason != SaveRejection.ContentChanged) return Refused(check.ReasonName, check.Message);
 
-            GameSnapshot? snapshot = JsonSerializer.Deserialize<GameSnapshot>(envelope.Payload, ReadOptions);
+            GameSnapshot? snapshot;
+            try
+            {
+                snapshot = JsonSerializer.Deserialize<GameSnapshot>(envelope.Payload, ReadOptions);
+            }
+            catch (JsonException error)
+            {
+                return Refused("wrong_format", "The game in this save cannot be read: " + error.Message);
+            }
+
             if (snapshot == null) return Refused("no_payload", "This save carries no game to restore.");
 
-            core.Restore(snapshot);
+            // The rules would refuse this too, but it is a save from another version of Cantrip.Core,
+            // not one from other content, and a game may want to tell the player so.
+            if (snapshot.FormatVersion != GameSnapshot.CurrentFormat)
+            {
+                return Refused("wrong_format",
+                    "The game in this save is in format " + snapshot.FormatVersion + "; this version of Cantrip.Core reads format " + GameSnapshot.CurrentFormat + ".");
+            }
+
+            try
+            {
+                core.Restore(snapshot);
+            }
+            catch (InvalidOperationException error)
+            {
+                // The rules refuse before they change anything, so there is nothing to put back.
+                return Refused("content_changed", error.Message);
+            }
+
             _choices.Close();
             _announcedChoice = 0;
             Buffer.Reset();
@@ -502,10 +676,23 @@ namespace Cantrip.GodotAdapter
         /// Answers a name the rules do not know, such as a game-specific selector. The callable is
         /// asked for a value and must not change anything: it runs inside rules resolution.
         /// </summary>
-        public void RegisterName(string name, Callable callable) => _host.RegisterName(name, callable);
+        /// <remarks>
+        /// Any Callable will do: a method, a lambda, or either with <c>.bind()</c>. The parameter is
+        /// a Variant rather than a <see cref="Callable"/> because C#'s Callable holds only an object
+        /// and a method name, or a C# delegate, so a GDScript lambda or bound Callable converted to
+        /// one arrives empty. A Variant keeps it whole; see <see cref="GodotEffectHost"/>. The node
+        /// keeps it until the name is registered again or the node is freed, then disposes it, and
+        /// refuses, with an <see cref="ArgumentException"/>, anything that cannot be called. From
+        /// C#, pass a <see cref="Callable"/>, which becomes a new Variant for the call, rather than
+        /// a Variant you go on using or register twice.
+        /// </remarks>
+        public void RegisterName(string name, Variant callable) => _host.RegisterName(name, callable);
 
-        /// <summary>Answers a function the rules do not know, such as <c>within(5)</c> in a spatial game.</summary>
-        public void RegisterFunction(string name, Callable callable) => _host.RegisterFunction(name, callable);
+        /// <summary>
+        /// Answers a function the rules do not know, such as <c>within(5)</c> in a spatial game. Any
+        /// Callable will do, as for <see cref="RegisterName"/>.
+        /// </summary>
+        public void RegisterFunction(string name, Variant callable) => _host.RegisterFunction(name, callable);
 
         // Internals ------------------------------------------------------------------------------
 
@@ -519,6 +706,30 @@ namespace Cantrip.GodotAdapter
             public string Fingerprint { get; set; } = string.Empty;
 
             public string Snapshot { get; set; } = string.Empty;
+        }
+
+        private DiagnosticBag Load(string folder)
+        {
+            if (_core != null) throw new InvalidOperationException("Content is already in play; use ReloadContent to change it.");
+
+            Content = new ContentLibrary();
+            DiagnosticBag problems = GodotContentLoader.LoadFolder(Content, string.IsNullOrEmpty(folder) ? ContentFolder : folder);
+            _describerGeneration = -1;
+            return problems;
+        }
+
+        /// <summary>
+        /// Puts each error and warning in the Output panel on one line, worded as the importer and
+        /// the command-line tool word it: <c>file:line:column: error CODE: message</c>. Notes stay
+        /// out of a running game's output.
+        /// </summary>
+        private static void Report(IEnumerable<Diagnostic> problems)
+        {
+            foreach (Diagnostic problem in problems)
+            {
+                if (problem.Severity == DiagnosticSeverity.Error) GD.PushError(problem.ToString());
+                else if (problem.Severity == DiagnosticSeverity.Warning) GD.PushWarning(problem.ToString());
+            }
         }
 
         private CardRuntime EnsureRuntime()
@@ -598,29 +809,49 @@ namespace Cantrip.GodotAdapter
         /// callback, which the interpreter invokes in the middle of resolving; such a callback must
         /// answer and return. Acting again from a signal handler is fine: by then the action is over.
         /// </summary>
+        /// <remarks>
+        /// A query such as <see cref="CanPlay"/> or <see cref="Describe"/> evaluates content too, and
+        /// so can call a callback without any action running, which is why the host is asked as well.
+        /// </remarks>
         private void Guard()
         {
-            if (_busy)
+            if (_busy || _host.InCallback)
                 throw new InvalidOperationException(
-                    "The rules are resolving. A host callback must answer and return; it cannot play a card, end a turn or save from inside an effect.");
+                    "The rules are resolving. A host callback must answer and return; it cannot set the game up, play a card, end a turn or load a save while the rules wait for its answer.");
         }
 
         private void AfterAction()
         {
             // A handler that acts again arrives here a second time while the first drain is still
-            // walking the buffer. Let the outer one finish rather than deliver the same events twice.
-            if (!_drainingEvents)
+            // walking the buffer. The outer one tells this action's events once its own batch is
+            // done, and then whether the battle ended, so the game hears them in the order they
+            // happened. The handler may be waiting on a choice its call left, so that is told now.
+            if (_drainingEvents)
             {
-                _drainingEvents = true;
-                try
+                SyncChoice();
+                return;
+            }
+
+            _drainingEvents = true;
+            try
+            {
+                // Until nothing is left: a batch holds only what was recorded before it began, and
+                // a handler that acts adds more. One that starts a new run ends this one: the rest
+                // of the batch is not told, since its ids would now name the new run's entities,
+                // while anything the handler then does in the new run is.
+                while (Buffer.Count > 0)
                 {
+                    CardRuntime? run = _core;
                     if (Presenter != null && IsInstanceValid(Presenter)) Presenter.Drain(Buffer);
-                    else Buffer.Drain(record => EmitSignal(SignalName.EffectEvent, VariantMap.Event(record)));
+                    else Buffer.Drain(record =>
+                    {
+                        if (_core == run) EmitSignal(SignalName.EffectEvent, VariantMap.Event(record));
+                    });
                 }
-                finally
-                {
-                    _drainingEvents = false;
-                }
+            }
+            finally
+            {
+                _drainingEvents = false;
             }
 
             SyncChoice();
