@@ -120,24 +120,30 @@ namespace Cantrip.GodotAdapter
             string kind,
             string team,
             string zone,
-            int position,
+            int lane,
+            int rank,
             bool alive,
             bool dead,
             bool removed,
             string intent,
             int owner,
             int source,
+            bool partyMember,
+            bool acted,
             IReadOnlyList<string> tags,
             IReadOnlyDictionary<string, int> stats,
             IReadOnlyList<StatusView> statuses,
             IReadOnlyList<int> abilities)
         {
+            PartyMember = partyMember;
+            Acted = acted;
             Id = id;
             Name = name;
             Kind = kind;
             Team = team;
             Zone = zone;
-            Position = position;
+            Lane = lane;
+            Rank = rank;
             Alive = alive;
             Dead = dead;
             Removed = removed;
@@ -160,11 +166,20 @@ namespace Cantrip.GodotAdapter
         /// <summary>Lower-case side: neutral, player or enemy.</summary>
         public string Team { get; }
 
-        /// <summary>Where it lives: hand, draw, discard, board, relics, attached, or empty.</summary>
+        /// <summary>Where it lives: board, hand, draw, discard, exhaust, play, powers, relics, attached, dead, or empty.</summary>
         public string Zone { get; }
 
-        /// <summary>Board slot, which is what adjacency reads. Zero for anything not on the board.</summary>
-        public int Position { get; }
+        /// <summary>Slot across the board. Zero on a one-lane board, and for anything not on it.</summary>
+        public int Lane { get; }
+
+        /// <summary>
+        /// Slot along the facing axis, which together with <see cref="Lane"/> is where this actor
+        /// stands and what adjacency reads. Zero for anything not on the board.
+        /// </summary>
+        public int Rank { get; }
+
+        /// <summary>What <see cref="Rank"/> was called before a board had two axes. The same number.</summary>
+        public int Position => Rank;
 
         public bool Alive { get; }
 
@@ -186,6 +201,19 @@ namespace Cantrip.GodotAdapter
         /// <summary>Whoever applied or created it, which is what <c>source:</c> filters compare. Zero for none.</summary>
         public int Source { get; }
 
+        /// <summary>
+        /// True for an actor the game is asked for input for: the leader and the heroes beside it.
+        /// A summoned minion is an ally and not a member, which is what decides whether it takes a
+        /// step of its own and whether the battle is lost when it falls.
+        /// </summary>
+        public bool PartyMember { get; }
+
+        /// <summary>
+        /// True when this combatant has already taken its step this round. False for anything that
+        /// is not in the turn order, and for a view read without a live game beside it.
+        /// </summary>
+        public bool Acted { get; }
+
         public IReadOnlyList<string> Tags { get; }
 
         /// <summary>Current stats, after modifiers, ordinally keyed.</summary>
@@ -204,23 +232,30 @@ namespace Cantrip.GodotAdapter
         /// Which stats to read, or null for every stat the entity has. A game that shows three bars
         /// per actor passes those three: each stat read runs the modifier pipeline.
         /// </param>
-        public static EntityView Of(Entity entity, IReadOnlyList<string>? stats = null)
+        /// <param name="state">
+        /// The live game, for the one fact an entity does not carry on its own: whether it has taken
+        /// its step this round. Null leaves <see cref="Acted"/> false.
+        /// </param>
+        public static EntityView Of(Entity entity, IReadOnlyList<string>? stats = null, GameState? state = null)
         {
             if (entity == null) throw new ArgumentNullException(nameof(entity));
 
             return new EntityView(
                 entity.Id,
                 entity.Name,
-                entity.Kind.ToString().ToLowerInvariant(),
-                entity.Team.ToString().ToLowerInvariant(),
+                Words.KindName(entity.Kind),
+                Words.TeamName(entity.Team),
                 entity.Zone,
-                entity.Position,
+                entity.Lane,
+                entity.Rank,
                 entity.IsAlive,
                 entity.IsDead,
                 entity.IsRemoved,
                 entity.Intent ?? string.Empty,
                 entity.Owner?.Id ?? 0,
                 entity.Source?.Id ?? 0,
+                entity.IsPartyMember,
+                state != null && state.HasActed(entity),
                 SortedTags(entity.Tags),
                 ReadStats(entity, stats),
                 ReadStatuses(entity),

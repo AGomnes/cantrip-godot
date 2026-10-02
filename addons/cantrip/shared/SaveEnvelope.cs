@@ -8,7 +8,10 @@ namespace Cantrip.GodotAdapter
     {
         None,
 
-        /// <summary>Written by a newer or older version of the addon.</summary>
+        /// <summary>
+        /// Written by a newer version of the addon than this one, which cannot know what is in it.
+        /// An older version's save is not this: it is read, through <see cref="SaveEnvelope.Upgraded"/>.
+        /// </summary>
         WrongFormat,
 
         /// <summary>The envelope carries no snapshot.</summary>
@@ -20,6 +23,27 @@ namespace Cantrip.GodotAdapter
         /// has gone.
         /// </summary>
         ContentChanged,
+
+        /// <summary>
+        /// Effects are still resolving, so a snapshot would hold half an action. Only
+        /// <c>CantripRuntime.Save</c> answers with this; nothing loads a save in that moment.
+        /// </summary>
+        Resolving,
+
+        /// <summary>
+        /// A <c>next turn:</c> or <c>in N turns:</c> block whose statements a reload has changed is
+        /// still waiting to run, and a save can only name statements the loaded content still has.
+        /// It passes once that block has run. Only <c>CantripRuntime.Save</c> answers with this.
+        /// </summary>
+        ReloadPending,
+
+        /// <summary>
+        /// The save was written by a game whose clock ran at another rate than this one's, so every
+        /// cooldown and every duration in it would mean a different length of time. It is not the
+        /// content that changed: it is <c>CantripRuntime.TicksPerSecond</c>, or a turn-based game
+        /// being handed a real-time save. Only <c>CantripRuntime.LoadSave</c> answers with this.
+        /// </summary>
+        ClockChanged,
     }
 
     /// <summary>The verdict on one save file.</summary>
@@ -51,6 +75,9 @@ namespace Cantrip.GodotAdapter
             SaveRejection.WrongFormat => "wrong_format",
             SaveRejection.NoPayload => "no_payload",
             SaveRejection.ContentChanged => "content_changed",
+            SaveRejection.Resolving => "resolving",
+            SaveRejection.ReloadPending => "reload_pending",
+            SaveRejection.ClockChanged => "clock_changed",
             _ => throw new ArgumentOutOfRangeException(nameof(reason), reason, "This rejection has no word for script yet."),
         };
 
@@ -78,8 +105,18 @@ namespace Cantrip.GodotAdapter
     /// </remarks>
     public sealed class SaveEnvelope
     {
-        /// <summary>The envelope's own version, separate from the core's snapshot format.</summary>
-        public const int CurrentFormat = 1;
+        /// <summary>
+        /// The envelope's own version, separate from the core's snapshot format. Like that one it
+        /// only ever increases, and this addon reads every envelope up to its own: an older one is
+        /// brought forward by <see cref="Upgraded"/>, and only one from a newer addon, whose shape
+        /// this addon cannot know, is refused.
+        /// </summary>
+        /// <remarks>
+        /// <c>static readonly</c> rather than <c>const</c> for the reason
+        /// <c>GameSnapshot.CurrentFormat</c> gives: a <c>const</c> is baked into whatever reads it,
+        /// and this addon's whole distribution model is a dll swapped into someone's project.
+        /// </remarks>
+        public static readonly int CurrentFormat = 1;
 
         public SaveEnvelope(int format, string? fingerprint, string? payload)
         {
@@ -109,11 +146,12 @@ namespace Cantrip.GodotAdapter
         /// </summary>
         public SaveCheck Check(string? libraryFingerprint)
         {
-            if (Format != CurrentFormat)
+            if (Format > CurrentFormat)
             {
                 return new SaveCheck(
                     SaveRejection.WrongFormat,
-                    "This save is in format " + Format + "; this version of the addon writes format " + CurrentFormat + ".");
+                    "This save is in format " + Format + " and needs a newer version of the addon; this one reads up to format "
+                    + CurrentFormat + ".");
             }
 
             if (Payload.Length == 0)
@@ -132,6 +170,26 @@ namespace Cantrip.GodotAdapter
             }
 
             return new SaveCheck(SaveRejection.None, string.Empty);
+        }
+
+        /// <summary>
+        /// This envelope in the format this addon writes, so that the rest of the load path only
+        /// ever sees the current shape. It is itself when it is already current.
+        /// </summary>
+        /// <remarks>
+        /// Nothing moves here yet: format 1 is the only format there has been. The step exists
+        /// because it is what keeps "a save made by any 1.x release loads in every later 1.x" true
+        /// at the moment the number first changes. Refusing anything that is not exactly current
+        /// keeps that promise only by never changing the number, and the number then stops
+        /// describing the file. Each future format gets one step here, oldest first.
+        /// </remarks>
+        public SaveEnvelope Upgraded()
+        {
+            if (Format >= CurrentFormat) return this;
+
+            // 0 -> 1: there was no format 0.
+
+            return new SaveEnvelope(CurrentFormat, Fingerprint, Payload);
         }
 
         private static string Describe(string fingerprint) =>

@@ -54,7 +54,7 @@ namespace Cantrip.GodotAdapter
                 ["time"] = record.Time,
                 ["source"] = record.Source,
                 ["target"] = record.Target,
-                ["card"] = record.Card,
+                ["card"] = record.Action,
                 ["amount"] = record.AmountInt,
                 ["amount_raw"] = record.AmountRaw,
                 ["replaced"] = record.Replaced,
@@ -66,6 +66,11 @@ namespace Cantrip.GodotAdapter
 
         // Entities -------------------------------------------------------------------------------
 
+        /// <summary>
+        /// One entity as a dictionary: id, name, kind, team, zone, place, its tracked stats, its statuses
+        /// and its ability ids. The keys are a contract — a game reads them by name — so they do not
+        /// change within 1.x.
+        /// </summary>
         public static Godot.Collections.Dictionary Entity(EntityView view)
         {
             if (view == null) throw new ArgumentNullException(nameof(view));
@@ -84,12 +89,16 @@ namespace Cantrip.GodotAdapter
                 ["team"] = view.Team,
                 ["zone"] = view.Zone,
                 ["position"] = view.Position,
+                ["lane"] = view.Lane,
+                ["rank"] = view.Rank,
                 ["alive"] = view.Alive,
                 ["dead"] = view.Dead,
                 ["removed"] = view.Removed,
                 ["intent"] = view.Intent,
                 ["owner"] = view.Owner,
                 ["source"] = view.Source,
+                ["party_member"] = view.PartyMember,
+                ["acted"] = view.Acted,
                 ["tags"] = Strings(view.Tags),
                 ["stats"] = stats,
                 ["statuses"] = statuses,
@@ -97,6 +106,7 @@ namespace Cantrip.GodotAdapter
             };
         }
 
+        /// <summary>One status on an actor, as a dictionary: what it is, how many stacks and how long it has left.</summary>
         public static Godot.Collections.Dictionary Status(StatusView view)
         {
             if (view == null) throw new ArgumentNullException(nameof(view));
@@ -115,7 +125,15 @@ namespace Cantrip.GodotAdapter
 
         // Descriptions ---------------------------------------------------------------------------
 
-        public static Godot.Collections.Dictionary Description(DescriptionView view)
+        /// <param name="targetId">
+        /// Who the description is aimed at, for an intent. <see cref="NoEntity"/> everywhere else,
+        /// so every description dictionary has the same keys whatever made it.
+        /// </param>
+        /// <summary>
+        /// Rules text as a dictionary, with the values kept apart from the words so a UI can colour a
+        /// buffed number. Every description has the same keys, whatever made it.
+        /// </summary>
+        public static Godot.Collections.Dictionary Description(DescriptionView view, int targetId = NoEntity)
         {
             if (view == null) throw new ArgumentNullException(nameof(view));
 
@@ -133,9 +151,15 @@ namespace Cantrip.GodotAdapter
                 });
             }
 
+            // "cost" is always here, null for an entity that has none. It used to be left out, so a
+            // reader who never thought to call has() read a missing key as an empty dictionary.
             var description = new Godot.Collections.Dictionary
             {
+                ["cost"] = view.Cost == null ? default(Variant) : Segment(view.Cost),
                 ["name"] = view.Name,
+                ["target"] = targetId,
+                ["target_name"] = view.Against,
+                ["line"] = view.Line,
                 ["level"] = view.Level,
                 ["plain"] = view.Plain,
                 ["bbcode"] = view.BBCode,
@@ -145,10 +169,13 @@ namespace Cantrip.GodotAdapter
                 ["tooltips"] = tooltips,
             };
 
-            if (view.Cost != null) description["cost"] = Segment(view.Cost);
             return description;
         }
 
+        /// <summary>
+        /// One run of a description: its text, whether it is a value, and — when it is — the printed
+        /// number beside the current one, so "~~6~~ 9" can be drawn.
+        /// </summary>
         public static Godot.Collections.Dictionary Segment(SegmentView view)
         {
             if (view == null) throw new ArgumentNullException(nameof(view));
@@ -180,7 +207,7 @@ namespace Cantrip.GodotAdapter
 
             return new Godot.Collections.Dictionary
             {
-                ["severity"] = diagnostic.Severity.ToString().ToLowerInvariant(),
+                ["severity"] = Words.SeverityName(diagnostic.Severity),
                 ["code"] = diagnostic.Code ?? string.Empty,
                 ["message"] = diagnostic.Message ?? string.Empty,
                 ["suggestion"] = diagnostic.Suggestion ?? string.Empty,
@@ -190,6 +217,7 @@ namespace Cantrip.GodotAdapter
             };
         }
 
+        /// <summary>Every diagnostic as a dictionary with its code, severity, message and place, in the order they were found.</summary>
         public static Godot.Collections.Array Diagnostics(IEnumerable<Diagnostic> diagnostics)
         {
             var array = new Godot.Collections.Array();
@@ -199,15 +227,108 @@ namespace Cantrip.GodotAdapter
             return array;
         }
 
+        /// <summary>
+        /// What loading or reloading content came to: <c>ok</c>, the number of <c>errors</c> and
+        /// <c>warnings</c>, and the <c>diagnostics</c> themselves.
+        /// </summary>
+        /// <remarks>
+        /// <c>ok</c> is here because every caller of a bare diagnostics array had to write the same
+        /// scan for a severity of "error" before it knew whether its game had content to play, and
+        /// the addon's own debugger channel already answered the question with a flag.
+        /// </remarks>
+        public static Godot.Collections.Dictionary ContentReport(IEnumerable<Diagnostic> diagnostics)
+        {
+            int errors = 0;
+            int warnings = 0;
+            var array = new Godot.Collections.Array();
+            if (diagnostics != null)
+            {
+                foreach (Diagnostic diagnostic in diagnostics)
+                {
+                    if (diagnostic.Severity == DiagnosticSeverity.Error) errors++;
+                    else if (diagnostic.Severity == DiagnosticSeverity.Warning) warnings++;
+                    array.Add(Diagnostic(diagnostic));
+                }
+            }
+
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = errors == 0,
+                ["errors"] = errors,
+                ["warnings"] = warnings,
+                ["diagnostics"] = array,
+            };
+        }
+
+        // Refusals -------------------------------------------------------------------------------
+
+        /// <summary>
+        /// The shape every refusal crosses in: <c>accepted</c> false, a snake_case <c>reason</c> and
+        /// a <c>message</c> to show. A refusing call that also answers something when it succeeds
+        /// passes that key and its empty value, so the key is never simply absent.
+        /// </summary>
+        public static Godot.Collections.Dictionary Refused(string reason, string message, string alsoKey = "", Variant alsoValue = default)
+        {
+            var refusal = new Godot.Collections.Dictionary
+            {
+                ["accepted"] = false,
+                ["reason"] = reason,
+                ["message"] = message,
+            };
+
+            if (!string.IsNullOrEmpty(alsoKey)) refusal[alsoKey] = alsoValue;
+            return refusal;
+        }
+
+        // Zones ----------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Says so in the Output panel when a zone is not one the rules know.
+        /// </summary>
+        /// <remarks>
+        /// A warning and not a refusal: the core lets a game invent zones of its own, and that is
+        /// deliberate. But nothing catches a typo either — <c>AddCard("Guard", "hnd")</c> makes a
+        /// real card in a pile nothing will ever draw from — and a warning is the only thing that
+        /// tells the two apart without taking the ability away.
+        /// </remarks>
+        public static void WarnUnknownZone(string zone, string calledFrom)
+        {
+            if (Zones.IsWellKnown(zone)) return;
+
+            GD.PushWarning(
+                "Cantrip: " + calledFrom + " was given the zone \"" + zone + "\", which the rules do not know. "
+                + "A zone of your own works, but a misspelt one is a pile nothing will ever draw from. The known zones are "
+                + KnownZones + ".");
+        }
+
+        /// <summary>The well-known zones for a message; the empty one is named rather than shown.</summary>
+        private static readonly string KnownZones = BuildKnownZones();
+
+        private static string BuildKnownZones()
+        {
+            var named = new List<string>();
+            foreach (string zone in Zones.WellKnown)
+            {
+                if (zone.Length > 0) named.Add(zone);
+            }
+            return string.Join(", ", named) + ", and \"\" for none";
+        }
+
         // Choices --------------------------------------------------------------------------------
 
         /// <summary>
         /// A decision the rules are waiting on. The options are entity ids and views both: a UI
         /// needs the names to show, and the ids to answer with. An offer of content that does not
-        /// exist yet, as <c>discover</c> makes, has <c>kind</c> "offer": its <c>option_ids</c> are
-        /// the positions 0, 1, 2... and each option is the candidate's name, kind, tags and rules
+        /// exist yet, as <c>discover</c> makes, has <c>mode</c> "offer": its <c>option_ids</c> are
+        /// the numbers 1, 2, 3... and each option is the candidate's name, kind, tags and rules
         /// text, which <paramref name="describe"/> supplies.
         /// </summary>
+        /// <remarks>
+        /// The request says <c>mode</c> rather than <c>kind</c> because <c>kind</c> already means
+        /// three other things inside this one dictionary — what an entity is, what keyword declared
+        /// an offered definition, and whether a segment is text or a value — and the vocabulary of
+        /// <c>options[i]["kind"]</c> changes with it.
+        /// </remarks>
         public static Godot.Collections.Dictionary Choice(
             int requestId,
             PendingChoice choice,
@@ -230,7 +351,7 @@ namespace Cantrip.GodotAdapter
                         ["tags"] = Strings(offered.Tags),
                         ["text"] = describe?.Invoke(offered) ?? string.Empty,
                     });
-                    ids.Add(i);
+                    ids.Add(ChoiceBridge.OfferId(i));
                 }
             }
             else
@@ -245,7 +366,7 @@ namespace Cantrip.GodotAdapter
             return new Godot.Collections.Dictionary
             {
                 ["id"] = requestId,
-                ["kind"] = choice.IsOffer ? "offer" : "entities",
+                ["mode"] = choice.IsOffer ? "offer" : "entities",
                 ["prompt"] = choice.Prompt,
                 ["min"] = choice.Min,
                 ["max"] = choice.Max,
@@ -338,6 +459,7 @@ namespace Cantrip.GodotAdapter
 
         // Lists ----------------------------------------------------------------------------------
 
+        /// <summary>A list of ids as a Godot array. A null list gives an empty array rather than null, so script never has to check.</summary>
         public static Godot.Collections.Array Ids(IEnumerable<int> ids)
         {
             var array = new Godot.Collections.Array();
@@ -347,6 +469,7 @@ namespace Cantrip.GodotAdapter
             return array;
         }
 
+        /// <summary>The entities' ids as a Godot array, in order. Entities never cross the boundary themselves; only their ids do.</summary>
         public static Godot.Collections.Array Ids(IEnumerable<Entity> entities)
         {
             var array = new Godot.Collections.Array();
@@ -369,6 +492,7 @@ namespace Cantrip.GodotAdapter
             return result.ToArray();
         }
 
+        /// <summary>A list of strings as a Godot array. Null gives an empty array.</summary>
         public static Godot.Collections.Array Strings(IEnumerable<string> values)
         {
             var array = new Godot.Collections.Array();
@@ -378,6 +502,11 @@ namespace Cantrip.GodotAdapter
             return array;
         }
 
+        /// <summary>
+        /// A Godot array read back as strings, for a call that takes a list of names. Entries that are
+        /// not strings are skipped rather than refused, so a mistyped element shortens the list instead
+        /// of failing the call.
+        /// </summary>
         public static string[] ToStrings(Godot.Collections.Array? values)
         {
             if (values == null || values.Count == 0) return new string[0];
@@ -393,13 +522,23 @@ namespace Cantrip.GodotAdapter
         /// </summary>
         public sealed class Marshal : IValueMarshal
         {
+            /// <summary>
+            /// The addon's own conversion between rules values and Variants. The state is what turns ids back
+            /// into entities; without one, anything naming entities reads as empty.
+            /// </summary>
             public Marshal(GameState? state = null) => State = state;
 
             /// <summary>Needed to turn ids back into entities; without it an id list reads as empty.</summary>
             public GameState? State { get; set; }
 
+            /// <summary>A rules value as a Variant. Entities become ids, so nothing a script receives holds an engine object.</summary>
             public Variant ToVariant(Value value) => VariantMap.ToVariant(value);
 
+            /// <summary>
+            /// A Variant read back as a rules value, resolving ids through <paramref name="state"/> or, when
+            /// that is null, through <see cref="State"/>. With neither, anything naming entities comes back
+            /// empty rather than wrong.
+            /// </summary>
             public Value ToValue(Variant variant, GameState? state) => VariantMap.ToValue(variant, state ?? State);
         }
     }
